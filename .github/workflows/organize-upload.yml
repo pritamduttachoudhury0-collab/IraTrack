@@ -1,0 +1,216 @@
+name: Organize Uploaded ZIP
+
+on:
+  push:
+    paths:
+      - "**/*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: organize-upload
+  cancel-in-progress: false
+
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find uploaded ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t ZIPS < <(
+            git diff-tree --no-commit-id --name-only -r --diff-filter=AM "$GITHUB_SHA" |
+            grep -Ei '\.zip$' || true
+          )
+
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "::error::No ZIP file was found in the triggering commit."
+            exit 1
+          fi
+
+          if [ "${#ZIPS[@]}" -gt 1 ]; then
+            echo "::error::More than one ZIP was uploaded in this commit."
+            printf '%s\n' "${ZIPS[@]}"
+            exit 1
+          fi
+
+          ZIP="${ZIPS[0]}"
+
+          echo "Found ZIP: $ZIP"
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Create organization branch
+        id: branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="organize/$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}"
+
+          git switch --create "$BRANCH"
+
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Validate ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -t "${{ steps.zip.outputs.path }}" >/dev/null
+
+          echo "ZIP validation passed."
+
+      - name: Extract ZIP safely
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="${{ steps.zip.outputs.path }}"
+          DEST="$RUNNER_TEMP/extracted"
+
+          rm -rf "$DEST" organized
+          mkdir -p "$DEST" organized
+
+          python3 - "$ZIP" "$DEST" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
+
+          archive = sys.argv[1]
+          destination = sys.argv[2]
+
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+                  path = PurePosixPath(name)
+
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(
+                          f"Unsafe ZIP entry: {info.filename}"
+                      )
+
+              z.extractall(destination)
+          PY
+
+          cp -a "$DEST"/. organized/
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if find organized -type f \( \
+              -name "settings.gradle" -o \
+              -name "settings.gradle.kts" -o \
+              -name "build.gradle" -o \
+              -name "build.gradle.kts" -o \
+              -name "gradlew" \
+            \) -print -quit | grep -q .; then
+
+            TYPE="Android/Gradle"
+
+          elif find organized -type f \
+              -name "package.json" \
+              -print -quit | grep -q .; then
+
+            TYPE="Node.js"
+
+          elif find organized -type f \( \
+              -name "pyproject.toml" -o \
+              -name "requirements.txt" -o \
+              -name "setup.py" \
+            \) -print -quit | grep -q .; then
+
+            TYPE="Python"
+
+          elif find organized -type f \( \
+              -name "pom.xml" -o \
+              -name "*.java" \
+            \) -print -quit | grep -q .; then
+
+            TYPE="Java"
+
+          else
+            TYPE="Unknown"
+          fi
+
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "Detected project type: $TYPE"
+
+      - name: Create organization report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p organized/.organization
+
+          {
+            echo "# ZIP Organization Report"
+            echo
+            echo "- Source ZIP: \`${{ steps.zip.outputs.path }}\`"
+            echo "- Project type: **${{ steps.detect.outputs.type }}**"
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Generated branch: \`${{ steps.branch.outputs.name }}\`"
+            echo
+            echo "## Files"
+            echo
+            echo '```text'
+            find organized -type f \
+              ! -path "organized/.organization/*" \
+              -printf '%P\n' | sort
+            echo '```'
+          } > organized/.organization/REPORT.md
+
+      - name: Remove uploaded ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -f "${{ steps.zip.outputs.path }}"
+
+      - name: Commit changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "::warning::Nothing changed."
+            exit 0
+          fi
+
+          git commit -m "chore: organize uploaded ZIP"
+
+      - name: Push organization branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git push --set-upstream origin "${{ steps.branch.outputs.name }}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## ZIP Organization Complete"
+            echo
+            echo "**Project type:** ${{ steps.detect.outputs.type }}"
+            echo
+            echo "**Branch:** \`${{ steps.branch.outputs.name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
